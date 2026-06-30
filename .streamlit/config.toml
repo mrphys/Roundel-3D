@@ -1,0 +1,13 @@
+[global]
+developmentMode = false
+
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+fileWatcherType = "none"
+maxUploadSize = 2048      # MB
+maxMessageSize = 2048     # MB
+
+[browser]
+gatherUsageStats = false

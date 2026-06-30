@@ -1,0 +1,37 @@
+# --- numerical / ML ---
+scipy==1.13.1
+pandas==2.2.2
+scikit-learn==1.5.2
+scikit-image==0.24.0
+monai==1.3.2
+
+# --- medical imaging I/O ---
+nibabel==5.2.1
+pydicom==2.2.2
+pylibjpeg==2.1.0
+pylibjpeg-libjpeg==2.4.0
+pylibjpeg-openjpeg==2.4.0
+
+# --- image / video ---
+opencv-python-headless==4.13.0.92
+imageio==2.37.3
+Pillow==10.4.0
+matplotlib==3.9.2
+
+# --- vessel measurement ---
+networkx==3.3
+
+# --- visualisation ---
+plotly==5.24.1
+
+# --- streamlit app ---
+streamlit==1.40.1
+streamlit-drawable-canvas==0.9.3
+stqdm==0.0.5
+
+# --- misc ---
+h5py==3.11.0
+typing_extensions==4.12.1
+
+numpy==1.26.4
+opencv-python-headless==4.9.0.80
