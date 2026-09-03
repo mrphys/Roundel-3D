@@ -20,6 +20,95 @@ import tempfile
 import io
 st.session_state['N'] = 5
 
+# ============================================================================
+# Orientation-agnostic reslicing
+# Reorients any acquisition plane (sagittal/coronal/axial) to the layout the
+# model was trained on, and auto-corrects L-R sense from the DICOM headers.
+# Based on ImageOrientationPatient (LPS) direction cosines.
+# ============================================================================
+import nibabel as nib
+
+# The patient-space axis convention the model expects (calibrated from a working
+# sagittal series via the calibration probe).
+MODEL_AXCODES  = ('I', 'P', 'R')
+# The L-R sense of a correctly-displaying (working) sagittal case:
+#   -1 => the volume's L-R axis is Right-increasing (matches the model)
+#   +1 => Left-increasing
+MODEL_LR_SENSE = -1
+
+
+def _direction_to_label(vec):
+    """Map an LPS direction vector to its dominant anatomical label.
+    LPS axes: X+ = Left, Y+ = Posterior, Z+ = Superior."""
+    pos = ['L', 'P', 'S']; neg = ['R', 'A', 'I']
+    i = int(np.argmax(np.abs(vec)))
+    return pos[i] if vec[i] >= 0 else neg[i]
+
+
+def _detect_lr_sense(iop):
+    """Read the volume's L-R sense straight from ImageOrientationPatient.
+    Returns +1 if the L-R (patient X) axis is Left-increasing, -1 if Right-increasing.
+    Works for any acquisition plane because it finds whichever acquisition axis
+    (row / column / slice-normal) is most aligned with patient X."""
+    iop = np.array([float(x) for x in iop], float)
+    row_dir, col_dir = iop[:3], iop[3:]
+    slice_dir = np.cross(row_dir, col_dir)
+    lr_vec = max([row_dir, col_dir, slice_dir], key=lambda v: abs(v[0]))
+    return +1 if lr_vec[0] >= 0 else -1
+
+
+def _dicom_affine(iop, ipp_first, pixelspacing, slice_spacing):
+    """4x4 affine: voxel (row_i, col_j, slice_k) -> patient LPS mm."""
+    row_cos = np.array(iop[:3], float)   # increasing COLUMN index
+    col_cos = np.array(iop[3:], float)   # increasing ROW index
+    normal  = np.cross(row_cos, col_cos)
+    aff = np.eye(4)
+    aff[:3, 0] = col_cos * pixelspacing[0]   # axis 0 = rows (height)
+    aff[:3, 1] = row_cos * pixelspacing[1]   # axis 1 = cols (width)
+    aff[:3, 2] = normal  * slice_spacing     # axis 2 = slices (depth)
+    aff[:3, 3] = np.array(ipp_first, float)
+    return aff
+
+
+def reorient_volume(image_hwdt, iop, ipp_first, pixelspacing, slice_spacing,
+                    target_axcodes=MODEL_AXCODES, model_lr_sense=MODEL_LR_SENSE):
+    """
+    Reorder/flip the spatial axes of (H,W,D[,T]) to the model's canonical layout,
+    then auto-correct L-R sense from the DICOM headers.
+    Returns (reoriented_volume, spacing_out_per_axis).
+    """
+    has_T = (image_hwdt.ndim == 4)
+    T = image_hwdt.shape[3] if has_T else 1
+
+    aff = _dicom_affine(iop, ipp_first, pixelspacing, slice_spacing)
+    aff_ras = np.diag([-1., -1., 1., 1.]) @ aff          # LPS -> RAS for nibabel
+
+    cur  = nib.io_orientation(aff_ras)
+    targ = nib.orientations.axcodes2ornt(target_axcodes)
+    tr   = nib.orientations.ornt_transform(cur, targ)
+
+    frames = []
+    for t in range(T):
+        vol = image_hwdt[..., t] if has_T else image_hwdt
+        frames.append(nib.orientations.apply_orientation(vol, tr))
+    out = np.stack(frames, axis=-1) if has_T else frames[0]
+
+    # spacing reordered to match the permuted output axes
+    spacing_in = np.array([pixelspacing[0], pixelspacing[1], slice_spacing], float)
+    spacing_out = spacing_in[tr[:, 0].astype(int)]
+
+    # --- automatic L-R correction from the headers ---
+    lr_sense = _detect_lr_sense(iop)
+    if lr_sense != model_lr_sense:
+        # axis 2 is the L-R (R) axis in the ('I','P','R') target
+        out = out[:, :, ::-1, :].copy() if has_T else out[:, :, ::-1].copy()
+        print(f"[LR] auto-flipped L-R (header sense {lr_sense:+d} != model {model_lr_sense:+d})", flush=True)
+    else:
+        print(f"[LR] no auto-flip (header sense {lr_sense:+d} matches model)", flush=True)
+
+    return out, spacing_out
+
+
 class Pipeline:
     def __init__(self, dcms):
         self.dcms  = dcms
@@ -131,6 +220,40 @@ class Pipeline:
         except:
             self.status = 'Mismatched timesteps'
             raise ValueError('Mismatched timesteps')
+
+        # --- reorient any acquisition plane to the model's canonical layout ---
+        first = self.sax_df.iloc[0]
+        iop = first['orientation']
+        ipp = first['position']
+        ps  = first['pixelspacing']
+        th  = first['thickness']
+
+        # [ORIENT] debug
+        print("=" * 60, flush=True)
+        print("[ORIENT] raw IOP:", iop, flush=True)
+        print("[ORIENT] raw IPP:", ipp, flush=True)
+        print("[ORIENT] pixelspacing:", ps, " thickness:", th, flush=True)
+        print("[ORIENT] shape before reorient (H,W,D,T):", image_4D.shape, flush=True)
+
+        have_geom = not (np.isscalar(iop) and pd.isna(iop)) and not (np.isscalar(ipp) and pd.isna(ipp))
+        if have_geom:
+            row_cos = np.array(iop[:3], float); col_cos = np.array(iop[3:], float)
+            normal = np.cross(row_cos, col_cos)
+            plane = {0:"SAGITTAL",1:"CORONAL",2:"AXIAL"}[int(np.argmax(np.abs(normal)))]
+            print(f"[ORIENT] plane: {plane}   slice normal: {normal.round(3)}", flush=True)
+            image_4D, spacing_out = reorient_volume(
+                image_4D, iop, ipp, pixelspacing=(ps, ps),
+                slice_spacing=th, target_axcodes=MODEL_AXCODES,
+                model_lr_sense=MODEL_LR_SENSE)
+        else:
+            print("[ORIENT] no geometry in header -> volume left as-is", flush=True)
+            spacing_out = np.array([ps, ps, th], float)
+
+        print("[ORIENT] shape AFTER reorient (H,W,D,T):", image_4D.shape, flush=True)
+        print("[ORIENT] reoriented per-axis spacing:", np.round(spacing_out, 3), flush=True)
+        print("=" * 60, flush=True)
+
+        self.reoriented_spacing = spacing_out
         return image_4D
     
     def calc_N_timesteps(self,sax_df):

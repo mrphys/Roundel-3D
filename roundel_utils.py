@@ -3,10 +3,22 @@ import traceback
 import torch
 from im2sim.models import UNet
 
+def _get_threejs_src():
+    """Return the bundled three.js source (works in dev and PyInstaller-frozen)."""
+    import sys
+    if '_threejs_src_cache' not in globals():
+        if getattr(sys, 'frozen', False):
+            base = Path(sys._MEIPASS)
+        else:
+            base = Path(__file__).parent
+        globals()['_threejs_src_cache'] = (
+            base / "assets" / "three.min.js").read_text(encoding='utf-8')
+    return globals()['_threejs_src_cache']
+
 
 _HEART_HTML = """
 <div id="c" style="width:100%;height:420px;background:#000;"></div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>__THREEJS__</script>
 <script>
 const meshes = __MESHES__;
 const W = document.getElementById('c').clientWidth, H = 420;
@@ -105,73 +117,84 @@ def segmentation_view():
 
     if 'disable_upload' not in st.session_state:
         st.session_state['disable_upload'] = False
-    
+
     col1, col2 = st.columns(2)
     with col1:
         zip_file = st.file_uploader(
             "Upload ZIP DICOM directory",
             type=["zip"],
             accept_multiple_files=False,
-            disabled = st.session_state['disable_upload']
+            disabled=st.session_state['disable_upload']
         )
-        if zip_file:
+
+        # L-R flip toggle (for datasets whose pixels are mirrored vs. their header)
+        flip_lr = st.checkbox(
+            "Flip left–right before processing",
+            value=st.session_state.get('flip_lr', False),
+            key='flip_lr',
+            disabled=st.session_state['disable_upload'],
+            help="Tick if the image displays mirrored (heart/apex on the wrong side)."
+        )
+
+        # Read the DICOMs into the Pipeline as soon as a zip is present, but DON'T
+        # segment yet — wait for the Process button so the flip choice is applied first.
+        if zip_file and not st.session_state['disable_upload']:
             dcms = extract_dicom_from_zip(zip_file)
             if dcms:
-                st.session_state['disable_upload'] = True
                 print(f"[DEBUG] DICOM files extracted: {len(dcms)}")
-                image, sax_df = Pipeline(dcms)
+                pipe = Pipeline(dcms)                     # keep the object
+                image, sax_df = pipe.image, pipe.sax_df
+                st.session_state['_pending_image'] = image
                 st.session_state['sax_df'] = sax_df
-                first_dcm = sax_df['dcm'].values[0]
+                st.session_state['reoriented_spacing'] = pipe.reoriented_spacing
 
+                first_dcm = sax_df['dcm'].values[0]
                 st.session_state.patient_name = str(first_dcm.PatientName) if hasattr(first_dcm, 'PatientName') and first_dcm.PatientName else 'Anonymised Patient'
                 st.session_state.series_date = str(first_dcm.SeriesDate) if hasattr(first_dcm, 'SeriesDate') and first_dcm.SeriesDate else 'Unknown'
                 st.session_state.series_description = str(first_dcm.SeriesDescription) if hasattr(first_dcm, 'SeriesDescription') and first_dcm.SeriesDescription else 'Unknown'
                 st.session_state.pixelspacing = sax_df.pixelspacing.unique()[0]
                 st.session_state.thickness = sax_df.thickness.unique()[0]
                 st.session_state['sax_series_uid'] = first_dcm.SeriesInstanceUID
-
                 st.session_state.n_slices = sax_df['slicelocation'].nunique()
                 st.session_state.n_phases = sax_df.loc[sax_df['slicelocation'] == sax_df['slicelocation'].values[0]]['triggertime'].nunique()
-        
+
+        # Process button: only shown once a series is loaded and not yet processed
+        can_process = ('_pending_image' in st.session_state
+                       and not st.session_state['disable_upload'])
+        if can_process:
+            if st.button("▶ Process", type="primary", use_container_width=True):
+                image = st.session_state['_pending_image']
+                if st.session_state.get('flip_lr', False):
+                    image = image[:, :, ::-1, :].copy()   # flip L-R (axis 2) before processing
+                st.session_state['_process_image'] = image
+                st.session_state['disable_upload'] = True
+                st.rerun()
 
     with col2:
-        # Create dataframe
         if st.session_state['disable_upload']:
             dicom_data = {
-                "Field": [
-                    "Patient Name",
-                    "Series Date",
-                    "Series Description",
-                    "Pixel Size",
-                    "Slice Thickness",
-                    "Number of Images",
-                    "Number of Slices",
-                    "Number of Phases",
-                    "Slice × Phases"
-                ],
+                "Field": ["Patient Name", "Series Date", "Series Description",
+                          "Pixel Size", "Slice Thickness", "Number of Images",
+                          "Number of Slices", "Number of Phases", "Slice × Phases"],
                 "Value": [
                     st.session_state.patient_name,
                     st.session_state.series_date,
                     st.session_state.series_description,
                     f"{st.session_state.pixelspacing} x {st.session_state.pixelspacing} mm",
                     f"{st.session_state.thickness} mm",
-                    len(st.session_state['sax_df'] ),
+                    len(st.session_state['sax_df']),
                     st.session_state.n_slices,
                     st.session_state.n_phases,
                     st.session_state.n_slices * st.session_state.n_phases
                 ]
             }
-
             df_dicom = pd.DataFrame(dicom_data).set_index('Field')
-
-            # Display dataframe in Streamlit
             st.dataframe(df_dicom, use_container_width=True)
 
-    
     if "initialized_all" not in st.session_state and st.session_state['disable_upload']:
+        image = st.session_state['_process_image']
         with st.spinner("Segmenting..."):
             segment_image(image)
-        
         with st.spinner("Initialising..."):
             initialize_app()
 
@@ -179,21 +202,62 @@ def segmentation_view():
         st.success('Segmentation Confirmed! ⭕️')
 
 
+def center_crop_or_pad(volume, target_shape=(112, 160, 96)):
+    """
+    Center crop or symmetrically zero-pad a (H, W, D) volume to exactly target_shape.
+    Larger axes are center-cropped; smaller axes are symmetrically zero-padded.
+    Each axis handled independently.
+    """
+    out = volume
+    for ax, target in enumerate(target_shape):
+        current = out.shape[ax]
+        if current == target:
+            continue
+        if current > target:                       # center-crop this axis
+            start = (current - target) // 2
+            sl = [slice(None)] * out.ndim
+            sl[ax] = slice(start, start + target)
+            out = out[tuple(sl)]
+        else:                                       # symmetric zero-pad this axis
+            total = target - current
+            before = total // 2
+            after = total - before
+            pad = [(0, 0)] * out.ndim
+            pad[ax] = (before, after)
+            out = np.pad(out, pad, mode='constant', constant_values=0)
+    assert out.shape[:3] == tuple(target_shape), f"got {out.shape}, want {target_shape}"
+    return out
+
+
 def segment_image(image):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # --- Resample to isotropic BEFORE inference (model trained isotropic) ---
-    ps = float(st.session_state['pixelspacing'])
-    th = float(st.session_state['thickness'])
+    # --- Resample to FIXED 1.5mm isotropic BEFORE inference (model trained isotropic) ---
+    TARGET_ISO = 1.5   # mm — fixed resolution the model was trained on
+    # per-axis spacing AFTER reorientation (slice-thickness axis may have moved)
+    sx0, sx1, sx2 = st.session_state.get(
+        'reoriented_spacing',
+        (float(st.session_state['pixelspacing']),
+         float(st.session_state['pixelspacing']),
+         float(st.session_state['thickness'])))
     iso_image_list = []
     for t in range(image.shape[-1]):
         img_t = image[..., t].astype(np.float32)            # (H, W, D)
         img_iso, target_sp, zfac = resample_to_isotropic(
-            img_t, in_spacing=(ps, ps, th), target=ps, order=1)
+            img_t, in_spacing=(sx0, sx1, sx2), target=TARGET_ISO, order=1)
         iso_image_list.append(img_iso)
     image = np.stack(iso_image_list, axis=-1)               # (H', W', D', T) isotropic
-    st.session_state['iso_spacing'] = target_sp             # record for everyone downstream
+    st.session_state['iso_spacing'] = target_sp             # = 1.5, for everyone downstream
     st.session_state['iso_zoom'] = zfac
+
+    # --- center crop/pad to the FIXED training shape; this cropped volume is
+    #     what the model AND all downstream steps use from here on ---
+    TRAIN_SHAPE = (160, 96, 112)
+    cropped_list = []
+    for t in range(image.shape[-1]):
+        cropped_list.append(center_crop_or_pad(image[..., t], TRAIN_SHAPE))
+    image = np.stack(cropped_list, axis=-1)                 # (112, 160, 96, T)
+    print("[CROP] volume cropped to training shape:", image.shape, flush=True)
 
     # --- Build / cache the model -------------------------------------------
     if 'model' not in st.session_state:
@@ -327,7 +391,11 @@ def initialize_app():
         # -----------------------------
         mask_channels = [i for i in range(st.session_state.N) if i != bg_idx]
 
-        x_min, y_min, x_max, y_max = find_crop_box(np.max(raw_mask[...,mask_channels], axis=(-1,-2,-3)), crop_factor=1.5)
+        # No secondary heart-crop: the volume is already the fixed (112,160,96)
+        # rescaled+cropped grid, and the whole session works on it directly.
+        # Use a full-extent crop box so all downstream crop_box logic still holds.
+        H_full, W_full = raw_image.shape[0], raw_image.shape[1]
+        x_min, y_min, x_max, y_max = 0, 0, W_full, H_full
         st.session_state['subpixel_resolution'] = 2
 
         preprocessed_image = raw_image[y_min:y_max, x_min:x_max, :, :]
@@ -1020,7 +1088,8 @@ def mask_editor_view():
         ]
         meshes_json = json.dumps(meshes_with_alpha)
 
-        html = _HEART_HTML.replace("__MESHES__", meshes_json)
+        html = _HEART_HTML.replace("__MESHES__", json.dumps(meshes_with_alpha))
+        html = html.replace("__THREEJS__", _get_threejs_src())   # inline three.js (offline)
         import streamlit.components.v1 as components
         components.html(html, height=480, scrolling=False)
 
@@ -1031,8 +1100,8 @@ def mask_editor_view():
     if st.button("🪄 Run Corrector Model", type="primary", use_container_width=True):
             with st.spinner("Running corrector..."):
                 run_corrector_model(mode="dual15")
-                # in run_corrector_model or on corrector completion:
                 st.session_state['_editor_primed'] = False
+                st.session_state.pop('heart_geom', None)        # ← force 3D rebuild
                 st.rerun()
 
     # ---- Download masks as a zipped {patient}_masks folder ----

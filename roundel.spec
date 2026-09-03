@@ -13,6 +13,7 @@ hiddenimports = []
 _d, _b, _h = collect_all("imageio")
 datas += _d; binaries += _b; hiddenimports += _h
 datas += copy_metadata("imageio")
+datas += [("assets/three.min.js", "assets")]
 
 # --- shipped config (forces production mode, ports, etc.) ---
 datas.append((".streamlit/config.toml", ".streamlit"))

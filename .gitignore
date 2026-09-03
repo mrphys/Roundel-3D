@@ -1,5 +1,7 @@
 # Virtual environment
 .venv/
+build/
+
 
 # Python junk
 __pycache__/

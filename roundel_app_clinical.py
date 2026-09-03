@@ -8,7 +8,7 @@ logging.getLogger("streamlit.web.server.media_file_handler").setLevel(logging.ER
 logging.getLogger("tornado.application").setLevel(logging.ERROR)
 
 from roundel_utils import *
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+#os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 st.set_page_config(page_title="Roundel", page_icon="⭕️", layout='wide')
 
 # --------------------------------------------------------------
