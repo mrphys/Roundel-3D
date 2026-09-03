@@ -7,3 +7,5 @@ build/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+installer_template.iss
+roundel.spec
