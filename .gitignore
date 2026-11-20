@@ -9,3 +9,8 @@ __pycache__/
 .ipynb_checkpoints/
 installer_template.iss
 roundel.spec
+Roundel_Clinical.spec
+Roundel_3D.iss
+.devcontainer
+dist
+exe_installer

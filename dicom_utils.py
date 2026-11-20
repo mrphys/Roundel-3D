@@ -57,30 +57,57 @@ def _detect_lr_sense(iop):
     return +1 if lr_vec[0] >= 0 else -1
 
 
-def _dicom_affine(iop, ipp_first, pixelspacing, slice_spacing):
-    """4x4 affine: voxel (row_i, col_j, slice_k) -> patient LPS mm."""
+def slice_vector(positions):
+    """The step from one slice to the next, in patient LPS mm.
+
+    Measured between the first two slices in the order they are stacked, so
+    it carries the sense of that order as well as the true separation. The
+    plane's normal gives neither: it says which way the slices face, not
+    which way they were laid down, and the stacking here follows
+    InstanceNumber.
+    """
+    pos = np.asarray([[float(v) for v in p] for p in positions], dtype=float)
+    if len(pos) < 2:
+        return None
+    step = pos[1] - pos[0]
+    return step if np.linalg.norm(step) > 1e-6 else None
+
+
+def _dicom_affine(iop, ipp_first, pixelspacing, slice_spacing, slice_vec=None):
+    """4x4 affine: voxel (row_i, col_j, slice_k) -> patient LPS mm.
+
+    `slice_vec` is the real step between two stacked slices. Without one the
+    plane's normal is used instead, which is the old behaviour and is only
+    right when the slices happen to be stacked the way they face.
+    """
     row_cos = np.array(iop[:3], float)   # increasing COLUMN index
     col_cos = np.array(iop[3:], float)   # increasing ROW index
     normal  = np.cross(row_cos, col_cos)
     aff = np.eye(4)
     aff[:3, 0] = col_cos * pixelspacing[0]   # axis 0 = rows (height)
     aff[:3, 1] = row_cos * pixelspacing[1]   # axis 1 = cols (width)
-    aff[:3, 2] = normal  * slice_spacing     # axis 2 = slices (depth)
+    aff[:3, 2] = (np.asarray(slice_vec, float) if slice_vec is not None
+                  else normal * slice_spacing)   # axis 2 = slices (depth)
     aff[:3, 3] = np.array(ipp_first, float)
     return aff
 
 
 def reorient_volume(image_hwdt, iop, ipp_first, pixelspacing, slice_spacing,
-                    target_axcodes=MODEL_AXCODES, model_lr_sense=MODEL_LR_SENSE):
+                    target_axcodes=MODEL_AXCODES, model_lr_sense=MODEL_LR_SENSE,
+                    slice_vec=None):
     """
-    Reorder/flip the spatial axes of (H,W,D[,T]) to the model's canonical layout,
-    then auto-correct L-R sense from the DICOM headers.
+    Reorder/flip the spatial axes of (H,W,D[,T]) to the model's canonical layout.
     Returns (reoriented_volume, spacing_out_per_axis).
+
+    With `slice_vec` -- the real step between two stacked slices -- the result
+    is in target_axcodes by construction, left-right included, and the old
+    header-only L-R guess is left alone. Without one, the plane's normal
+    stands in for the slice direction and that guess is applied as before.
     """
     has_T = (image_hwdt.ndim == 4)
     T = image_hwdt.shape[3] if has_T else 1
 
-    aff = _dicom_affine(iop, ipp_first, pixelspacing, slice_spacing)
+    aff = _dicom_affine(iop, ipp_first, pixelspacing, slice_spacing, slice_vec)
     aff_ras = np.diag([-1., -1., 1., 1.]) @ aff          # LPS -> RAS for nibabel
 
     cur  = nib.io_orientation(aff_ras)
@@ -93,9 +120,20 @@ def reorient_volume(image_hwdt, iop, ipp_first, pixelspacing, slice_spacing,
         frames.append(nib.orientations.apply_orientation(vol, tr))
     out = np.stack(frames, axis=-1) if has_T else frames[0]
 
-    # spacing reordered to match the permuted output axes
-    spacing_in = np.array([pixelspacing[0], pixelspacing[1], slice_spacing], float)
-    spacing_out = spacing_in[tr[:, 0].astype(int)]
+    # Spacing reordered to match the permuted output axes. ornt[i, 0] says
+    # where input axis i ends up, so output axis j takes its spacing from
+    # input axis argsort(ornt[:, 0])[j] -- not from input axis ornt[j, 0],
+    # which is the same thing only when the permutation is its own inverse.
+    gap = (float(np.linalg.norm(slice_vec)) if slice_vec is not None
+           else slice_spacing)
+    spacing_in = np.array([pixelspacing[0], pixelspacing[1], gap], float)
+    spacing_out = spacing_in[np.argsort(tr[:, 0].astype(int))]
+
+    if slice_vec is not None:
+        # the geometry is known, so the volume is already in target_axcodes
+        print("[LR] no guess needed (slice direction measured from the "
+              "stacking)", flush=True)
+        return out, spacing_out
 
     # --- automatic L-R correction from the headers ---
     lr_sense = _detect_lr_sense(iop)
@@ -235,6 +273,13 @@ class Pipeline:
         print("[ORIENT] pixelspacing:", ps, " thickness:", th, flush=True)
         print("[ORIENT] shape before reorient (H,W,D,T):", image_4D.shape, flush=True)
 
+        # the step between two stacked slices, in the order they are stacked
+        slice_vec = slice_vector(
+            [self.sax_df.loc[self.sax_df['slicelocation'] == loc, 'position'].iloc[0]
+             for loc in self.sax_df.slicelocation.unique()[:2]])
+        print("[ORIENT] slice step from the stacking:",
+              None if slice_vec is None else np.round(slice_vec, 3), flush=True)
+
         have_geom = not (np.isscalar(iop) and pd.isna(iop)) and not (np.isscalar(ipp) and pd.isna(ipp))
         if have_geom:
             row_cos = np.array(iop[:3], float); col_cos = np.array(iop[3:], float)
@@ -244,7 +289,7 @@ class Pipeline:
             image_4D, spacing_out = reorient_volume(
                 image_4D, iop, ipp, pixelspacing=(ps, ps),
                 slice_spacing=th, target_axcodes=MODEL_AXCODES,
-                model_lr_sense=MODEL_LR_SENSE)
+                model_lr_sense=MODEL_LR_SENSE, slice_vec=slice_vec)
         else:
             print("[ORIENT] no geometry in header -> volume left as-is", flush=True)
             spacing_out = np.array([ps, ps, th], float)
